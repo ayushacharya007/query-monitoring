@@ -27,6 +27,26 @@ class QueryMonitoringStack(Stack):
     '''
     def __init__(self, scope: Construct, id: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
+        
+        # Dead Letter Queue
+        dlq = _sqs.Queue(self, "QueryMonitoringDLQ",
+                         queue_name="QueryMonitoringDLQ",
+                         retention_period=Duration.days(14),
+                         removal_policy=RemovalPolicy.DESTROY
+                         )
+        
+        
+        # SQS Queue to store Events
+        query_store_queue = _sqs.Queue(self, "QueryStoreQueue",
+                                       queue_name="QueryStoreQueue",
+                                       dead_letter_queue=_sqs.DeadLetterQueue(
+                                           max_receive_count=1,
+                                           queue=dlq
+                                       ),
+                                       visibility_timeout=Duration.minutes(15),
+                                       retention_period=Duration.days(5),
+                                       removal_policy=RemovalPolicy.DESTROY
+                                       )
 
         # S3 Bucket to store the query monitoring data
         query_details_bucket = s3.Bucket(self, "QueryDetailsBucket",
@@ -68,28 +88,9 @@ class QueryMonitoringStack(Stack):
                                            "DATABASE_NAME": query_monitoring_database.ref,
                                            "REGION": cdk.Aws.REGION,
                                            "ACCOUNT_ID": cdk.Aws.ACCOUNT_ID,
+                                           "QUEUE_URL": query_store_queue.queue_url
                                         },
                                         architecture=_lambda.Architecture.ARM_64
-                                       )
-        
-        # Dead Letter Queue
-        dlq = _sqs.Queue(self, "QueryMonitoringDLQ",
-                         queue_name="QueryMonitoringDLQ",
-                         retention_period=Duration.days(14),
-                         removal_policy=RemovalPolicy.DESTROY
-                         )
-        
-        
-        # SQS Queue to store Events
-        query_store_queue = _sqs.Queue(self, "QueryStoreQueue",
-                                       queue_name="QueryStoreQueue",
-                                       dead_letter_queue=_sqs.DeadLetterQueue(
-                                           max_receive_count=2,
-                                           queue=dlq
-                                       ),
-                                       visibility_timeout=Duration.hours(1),
-                                       retention_period=Duration.days(14),
-                                       removal_policy=RemovalPolicy.DESTROY
                                        )
         
         # Event Pattern
@@ -151,15 +152,10 @@ class QueryMonitoringStack(Stack):
             )
         )
         
-        # Add SQS as event source for Lambda
-        # Triggers after 1 hour OR 50 messages (whichever comes first)
-        query_monitoring_lambda.add_event_source(
-            _lambda_event_sources.SqsEventSource(
-                query_store_queue,
-                batch_size=1,  # Process up to 50 messages at once
-                # max_batching_window=Duration.hours(1),  # Or wait max 1 hour
-                report_batch_item_failures=True  # Enable partial batch failure handling
-            )
+        # Schedule the Lambda to run every 2 hours
+        _events.Rule(self, "QueryBatchProcessingRule",
+            schedule=_events.Schedule.cron(minute="0", hour="*/2"),
+            targets=[_events_targets.LambdaFunction(query_monitoring_lambda)] #type: ignore
         )
         
         # Grant SSM permissions for checkpoint tracking
