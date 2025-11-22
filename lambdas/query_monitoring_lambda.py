@@ -96,143 +96,146 @@ def get_query_details(query_id: list):
         logger.error(f"Unexpected error in get_query_details: {e}")
         raise
     
+    # ... (imports and setup)
+
+def process_query_ids(query_ids):
+    """
+    Fetches details for query IDs and saves to S3.
+    """
+    if not query_ids:
+        return 0
+        
+    all_query_details = []
+    logger.info(f"Starting to fetch query details for {len(query_ids)} query IDs")
+    
+    for i in range(0, len(query_ids), BATCH_SIZE):
+        batch = query_ids[i:i + BATCH_SIZE]
+        batch_details = get_query_details(batch)
+        all_query_details.extend(batch_details)
+    
+    if all_query_details:
+        logger.info(f"Successfully retrieved {len(all_query_details)} query details")
+        df = pd.DataFrame(all_query_details)
+        
+        wr.s3.to_parquet(
+            df=df,
+            path=f"s3://{BUCKET_NAME}/query_details",
+            index=False,
+            dataset=True,
+            mode="append",
+            database=DATABASE_NAME,
+            table="query_details",
+        )
+        logger.info(f"Processed {len(all_query_details)} queries.")
+        
+    return len(all_query_details)
+
+def poll_sqs_and_process():
+    """
+    Polls SQS for messages and processes them.
+    """
+    sqs = boto3.client('sqs')
+    queue_url = os.getenv('QUEUE_URL')
+    
+    if not queue_url:
+        logger.error("QUEUE_URL environment variable not set")
+        return 0
+        
+    total_processed = 0
+    
+    while True:
+        # Receive messages
+        response = sqs.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=10, # SQS limit
+            WaitTimeSeconds=0
+        )
+        
+        logger.info("Polling SQS for messages...")
+        logger.info(f"Received response: {response}")
+        
+        messages = response.get('Messages', [])
+        if not messages:
+            logger.info("No more messages in queue.")
+            break
+            
+        query_ids = []
+        receipt_handles = []
+        
+        for msg in messages:
+            try:
+                body = json.loads(msg['Body'])
+                query_id = body.get('detail', {}).get('queryExecutionId')
+                if query_id:
+                    query_ids.append(query_id)
+                    receipt_handles.append({
+                        'Id': msg['MessageId'],
+                        'ReceiptHandle': msg['ReceiptHandle']
+                    })
+            except Exception as e:
+                logger.error(f"Error parsing message: {e}")
+        
+        # Process batch
+        if query_ids:
+            count = process_query_ids(query_ids)
+            total_processed += count
+            
+            # Delete processed messages
+            if receipt_handles:
+                try:
+                    sqs.delete_message_batch(QueueUrl=queue_url, Entries=receipt_handles)
+                except Exception as e:
+                    logger.error(f"Failed to delete messages: {e}")
+                    
+    return total_processed
+
 def handler(event, context):
     """
-    Lambda handler with two modes:
+    Lambda handler with three modes:
     1. Initial backfill: Fetch all historical queries on first run
-    2. Event-driven: Process SQS messages containing Athena query events
+    2. Event-driven (SQS Trigger): Process SQS messages directly
+    3. Scheduled (Polling): Poll SQS queue for messages
     """
     try:
-        
         logger.info("Lambda handler started")
+        # logger.info(f"Event received: {json.dumps(event)}") # Reduced logging for large events
         
-        logger.info(f"Event received: {json.dumps(event)}")
-        
-        # Initialize SSM client to check if initial load is complete
+        # Initialize SSM client
         ssm_client = boto3.client('ssm')
-        
         parameter_name = '/query-monitoring/initial-load-complete'
         
-        # Check if initial load has been completed
+        # Check initial load status
         try:
             response = ssm_client.get_parameter(Name=parameter_name)
             initial_load_complete = response['Parameter']['Value'] == 'true'
+            logger.info("Initial load already completed.")
         except ssm_client.exceptions.ParameterNotFound:
             initial_load_complete = False
             logger.info("Initial load not yet completed. Starting backfill...")
         
         # MODE 1: Initial Backfill
         if not initial_load_complete:
-            logger.info("Running initial backfill of all query executions...")
+            logger.info("Running initial backfill...")
             ids = get_all_query_ids()
-            all_query_details = []
-            logger.info(f"Starting to fetch query details for {len(ids)} query IDs")
             
-            for i in range(0, len(ids), BATCH_SIZE):
-                batch = ids[i:i + BATCH_SIZE]
-                batch_details = get_query_details(batch)
-                all_query_details.extend(batch_details)
-                
-            # Process all details into a DataFrame
-            if all_query_details:
-                logger.info(f"Successfully retrieved {len(all_query_details)} query details")
-                df = pd.DataFrame(all_query_details)
-                
-                # Save to S3 using awswrangler
-                wr.s3.to_parquet(
-                    df=df,
-                    path=f"s3://{BUCKET_NAME}/data-schema/query_monitoring",
-                    index=False,
-                    dataset=True,
-                    mode="append",
-                    database=DATABASE_NAME,
-                    table="query_monitoring",
-                )
-                
-                logger.info(f"Initial backfill complete. Processed {len(all_query_details)} queries.")
-                
-                # Mark initial load as complete
-                ssm_client.put_parameter(
-                    Name=parameter_name,
-                    Value='true',
-                    Type='String',
-                    Overwrite=True,
-                    Description='Tracks whether initial query monitoring backfill is complete'
-                )
-            else:
-                logger.info("No query details found during initial backfill.")
-                
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'Initial backfill completed',
-                    'queries_processed': len(all_query_details)
-                })
-            }
-        
-        # MODE 2: Event-Driven Processing (SQS Messages)
+            count = process_query_ids(ids)
+            
+            ssm_client.put_parameter(
+                Name=parameter_name,
+                Value='true',
+                Type='String',
+                Overwrite=True,
+                Description='Tracks whether initial query monitoring backfill is complete'
+            )
+            
+            return {'statusCode': 200, 'body': json.dumps({'message': 'Backfill completed', 'count': count})}
+
+        # MODE 2: Scheduled Event (Poll SQS)
         else:
-            logger.info("Processing SQS messages from EventBridge...")
-            
-            # Extract query IDs from SQS messages
-            query_ids = []
-            for record in event.get('Records', []):
-                try:
-                    # Parse the SQS message body (which contains the EventBridge event)
-                    message_body = json.loads(record['body'])
-                    query_id = message_body.get('detail', {}).get('queryExecutionId')
-                    
-                    if query_id:
-                        query_ids.append(query_id)
-                        logger.info(f"Extracted query ID: {query_id}")
-                except Exception as e:
-                    logger.error(f"Error parsing SQS message: {e}")
-                    continue
-            
-            if not query_ids:
-                logger.info("No valid query IDs found in SQS messages.")
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps({'message': 'No queries to process'})
-                }
-            
-            # Fetch details for the queries
-            all_query_details = []
-            logger.info(f"Starting to fetch query details for {len(query_ids)} query IDs")
-            for i in range(0, len(query_ids), BATCH_SIZE):
-                batch = query_ids[i:i + BATCH_SIZE]
-                batch_details = get_query_details(batch)
-                all_query_details.extend(batch_details)
-            
-            # Save to S3
-            if all_query_details:
-                logger.info(f"Successfully retrieved {len(all_query_details)} query details")
-                df = pd.DataFrame(all_query_details)
-                df["last_updated"] = pd.Timestamp.now()
-                
-                wr.s3.to_parquet(
-                    df=df,
-                    path=f"s3://{BUCKET_NAME}/query_details",
-                    index=False,
-                    dataset=True,
-                    mode="append",
-                    database=DATABASE_NAME,
-                    table="query_details",
-                )
-                
-                logger.info(f"Processed {len(all_query_details)} new queries from SQS.")
-            
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'Event-driven processing completed',
-                    'queries_processed': len(all_query_details)
-                })
-            }
+            logger.info("Processing Scheduled Event (Polling SQS)...")
+            count = poll_sqs_and_process()
+            return {'statusCode': 200, 'body': json.dumps({'message': 'Scheduled polling completed', 'count': count})}
 
     except Exception as e:
         logger.error(f"Handler execution failed: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
-        }
+        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
