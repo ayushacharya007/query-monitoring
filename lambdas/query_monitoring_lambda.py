@@ -1,4 +1,5 @@
 import boto3
+import awswrangler as wr
 import os
 import logging
 import json
@@ -58,7 +59,6 @@ def get_query_details(query_id: list):
     Retrieves details of a specific query execution using its ID.
     """
     try:
-        logger.info(f"Starting to fetch query details for {len(query_id)} query IDs")
         response = client.batch_get_query_execution(QueryExecutionIds=query_id)
         
         # Create a list to store the extracted details
@@ -84,7 +84,6 @@ def get_query_details(query_id: list):
             }
             extracted_list.append(extracted)
             
-        logger.info(f"Successfully retrieved {len(extracted_list)} queries details")
         return extracted_list
 
     except ClientError as e:
@@ -127,6 +126,7 @@ def handler(event, context):
             logger.info("Running initial backfill of all query executions...")
             ids = get_all_query_ids()
             all_query_details = []
+            logger.info(f"Starting to fetch query details for {len(ids)} query IDs")
             
             for i in range(0, len(ids), BATCH_SIZE):
                 batch = ids[i:i + BATCH_SIZE]
@@ -135,11 +135,10 @@ def handler(event, context):
                 
             # Process all details into a DataFrame
             if all_query_details:
+                logger.info(f"Successfully retrieved {len(all_query_details)} query details")
                 df = pd.DataFrame(all_query_details)
-                df["last_updated"] = pd.Timestamp.now()
                 
                 # Save to S3 using awswrangler
-                import awswrangler as wr
                 wr.s3.to_parquet(
                     df=df,
                     path=f"s3://{BUCKET_NAME}/data-schema/query_monitoring",
@@ -199,6 +198,7 @@ def handler(event, context):
             
             # Fetch details for the queries
             all_query_details = []
+            logger.info(f"Starting to fetch query details for {len(query_ids)} query IDs")
             for i in range(0, len(query_ids), BATCH_SIZE):
                 batch = query_ids[i:i + BATCH_SIZE]
                 batch_details = get_query_details(batch)
@@ -206,10 +206,10 @@ def handler(event, context):
             
             # Save to S3
             if all_query_details:
+                logger.info(f"Successfully retrieved {len(all_query_details)} query details")
                 df = pd.DataFrame(all_query_details)
                 df["last_updated"] = pd.Timestamp.now()
                 
-                import awswrangler as wr
                 wr.s3.to_parquet(
                     df=df,
                     path=f"s3://{BUCKET_NAME}/query_details",

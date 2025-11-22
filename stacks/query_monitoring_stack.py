@@ -152,12 +152,12 @@ class QueryMonitoringStack(Stack):
         )
         
         # Add SQS as event source for Lambda
-        # Triggers after 1 hour OR 50 messages (whichever comes first)
+        # Triggers after 2 hour OR 50 messages (whichever comes first)
         query_monitoring_lambda.add_event_source(
             _lambda_event_sources.SqsEventSource(
                 query_store_queue,
-                batch_size=1,  # Process up to 50 messages at once
-                # max_batching_window=Duration.hours(1),  # Or wait max 1 hour
+                batch_size=10,
+                max_batching_window=Duration.minutes(5),    
                 report_batch_item_failures=True  # Enable partial batch failure handling
             )
         )
