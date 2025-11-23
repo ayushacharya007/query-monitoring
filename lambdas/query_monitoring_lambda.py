@@ -95,8 +95,7 @@ def get_query_details(query_id: list):
     except Exception as e:
         logger.error(f"Unexpected error in get_query_details: {e}")
         raise
-    
-    # ... (imports and setup)
+
 
 def process_query_ids(query_ids):
     """
@@ -130,9 +129,10 @@ def process_query_ids(query_ids):
         
     return len(all_query_details)
 
-def poll_sqs_and_process():
+def poll_sqs_and_process(context):
     """
-    Polls SQS for messages and processes them.
+    Polls SQS for messages, accumulates them into batches of BATCH_SIZE (50),
+    and processes them. Respects Lambda timeout.
     """
     sqs = boto3.client('sqs')
     queue_url = os.getenv('QUEUE_URL')
@@ -142,50 +142,76 @@ def poll_sqs_and_process():
         return 0
         
     total_processed = 0
+    accumulated_query_ids = []
+    accumulated_receipt_handles = []
     
     while True:
+        # Check for timeout (leave 1 minute buffer)
+        if context.get_remaining_time_in_millis() < 60000:
+            logger.warning("Lambda is approaching timeout. Stopping polling to flush buffer.")
+            break
+
         # Receive messages
         response = sqs.receive_message(
             QueueUrl=queue_url,
             MaxNumberOfMessages=10, # SQS limit
-            WaitTimeSeconds=0
+            WaitTimeSeconds=20 # Long polling
         )
         
         logger.info("Polling SQS for messages...")
-        logger.info(f"Received response: {response}")
         
         messages = response.get('Messages', [])
         if not messages:
             logger.info("No more messages in queue.")
             break
             
-        query_ids = []
-        receipt_handles = []
-        
         for msg in messages:
             try:
                 body = json.loads(msg['Body'])
                 query_id = body.get('detail', {}).get('queryExecutionId')
                 if query_id:
-                    query_ids.append(query_id)
-                    receipt_handles.append({
+                    accumulated_query_ids.append(query_id)
+                    accumulated_receipt_handles.append({
                         'Id': msg['MessageId'],
                         'ReceiptHandle': msg['ReceiptHandle']
                     })
             except Exception as e:
                 logger.error(f"Error parsing message: {e}")
         
-        # Process batch
-        if query_ids:
-            count = process_query_ids(query_ids)
+        # Check if we have enough messages to process a batch
+        while len(accumulated_query_ids) >= BATCH_SIZE:
+            # Extract a batch
+            batch_ids = accumulated_query_ids[:BATCH_SIZE]
+            batch_handles = accumulated_receipt_handles[:BATCH_SIZE]
+            
+            # Remove from accumulators
+            accumulated_query_ids = accumulated_query_ids[BATCH_SIZE:]
+            accumulated_receipt_handles = accumulated_receipt_handles[BATCH_SIZE:]
+            
+            # Process batch
+            count = process_query_ids(batch_ids)
             total_processed += count
             
-            # Delete processed messages
-            if receipt_handles:
+            # Delete processed messages in chunks of 10 (SQS limit)
+            for i in range(0, len(batch_handles), 10):
+                chunk = batch_handles[i:i+10]
                 try:
-                    sqs.delete_message_batch(QueueUrl=queue_url, Entries=receipt_handles)
+                    sqs.delete_message_batch(QueueUrl=queue_url, Entries=chunk)
                 except Exception as e:
                     logger.error(f"Failed to delete messages: {e}")
+
+    # Process any remaining messages
+    if accumulated_query_ids:
+        count = process_query_ids(accumulated_query_ids)
+        total_processed += count
+        
+        # Delete remaining messages in chunks of 10
+        for i in range(0, len(accumulated_receipt_handles), 10):
+            chunk = accumulated_receipt_handles[i:i+10]
+            try:
+                sqs.delete_message_batch(QueueUrl=queue_url, Entries=chunk)
+            except Exception as e:
+                logger.error(f"Failed to delete messages: {e}")
                     
     return total_processed
 
@@ -198,7 +224,6 @@ def handler(event, context):
     """
     try:
         logger.info("Lambda handler started")
-        # logger.info(f"Event received: {json.dumps(event)}") # Reduced logging for large events
         
         # Initialize SSM client
         ssm_client = boto3.client('ssm')
@@ -233,7 +258,7 @@ def handler(event, context):
         # MODE 2: Scheduled Event (Poll SQS)
         else:
             logger.info("Processing Scheduled Event (Polling SQS)...")
-            count = poll_sqs_and_process()
+            count = poll_sqs_and_process(context)
             return {'statusCode': 200, 'body': json.dumps({'message': 'Scheduled polling completed', 'count': count})}
 
     except Exception as e:

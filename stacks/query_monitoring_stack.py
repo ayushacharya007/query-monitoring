@@ -72,7 +72,7 @@ class QueryMonitoringStack(Stack):
         # AWS Wrangler Layer
         wrangler_layer = _lambda.LayerVersion.from_layer_version_arn(self, "SharedAwsWranglerLayer",
             layer_version_arn=os.environ["LAMBDA_LAYER_ARN"]
-        )   
+        )
 
         # Create the Lambda function that interacts with AWS Glue.
         query_monitoring_lambda = _lambda.Function(self, "QueryMonitoringLambda",
@@ -152,9 +152,9 @@ class QueryMonitoringStack(Stack):
             )
         )
         
-        # Schedule the Lambda to run every 2 hours
+        # Schedule the Lambda to run at 00:00 every day
         _events.Rule(self, "QueryBatchProcessingRule",
-            schedule=_events.Schedule.cron(minute="0", hour="*/2"),
+            schedule=_events.Schedule.cron(minute="0", hour="0"), # run every 00:00
             targets=[_events_targets.LambdaFunction(query_monitoring_lambda)] #type: ignore
         )
         
