@@ -27,9 +27,6 @@ def get_all_query_ids(workgroup='primary'):
     """
     query_ids = []
     try:
-        logger.info(f"Starting to fetch query IDs from workgroup: {workgroup}")
-        logger.info(f"Configuration - Bucket: {BUCKET_NAME}, Database: {DATABASE_NAME}")
-
         response = client.list_query_executions(WorkGroup=workgroup)
         
         next_token = response.get('NextToken')
@@ -39,8 +36,6 @@ def get_all_query_ids(workgroup='primary'):
             response = client.list_query_executions(WorkGroup=workgroup, NextToken=next_token)
             next_token = response.get('NextToken')
             query_ids.extend(response['QueryExecutionIds'])
-
-        logger.info(f"Successfully retrieved total {len(query_ids)} query IDs")
 
         return query_ids
     except ClientError as e:
@@ -105,7 +100,6 @@ def process_query_ids(query_ids):
         return 0
         
     all_query_details = []
-    logger.info(f"Starting to fetch query details for {len(query_ids)} query IDs")
     
     for i in range(0, len(query_ids), BATCH_SIZE):
         batch = query_ids[i:i + BATCH_SIZE]
@@ -113,7 +107,6 @@ def process_query_ids(query_ids):
         all_query_details.extend(batch_details)
     
     if all_query_details:
-        logger.info(f"Successfully retrieved {len(all_query_details)} query details")
         df = pd.DataFrame(all_query_details)
         
         wr.s3.to_parquet(
@@ -125,7 +118,6 @@ def process_query_ids(query_ids):
             database=DATABASE_NAME,
             table="query_details",
         )
-        logger.info(f"Processed {len(all_query_details)} queries.")
         
     return len(all_query_details)
 
@@ -158,11 +150,8 @@ def poll_sqs_and_process(context):
             WaitTimeSeconds=20 # Long polling
         )
         
-        logger.info("Polling SQS for messages...")
-        
         messages = response.get('Messages', [])
         if not messages:
-            logger.info("No more messages in queue.")
             break
             
         for msg in messages:
@@ -223,8 +212,6 @@ def handler(event, context):
     3. Scheduled (Polling): Poll SQS queue for messages
     """
     try:
-        logger.info("Lambda handler started")
-        
         # Initialize SSM client
         ssm_client = boto3.client('ssm')
         parameter_name = '/query-monitoring/initial-load-complete'
@@ -233,14 +220,11 @@ def handler(event, context):
         try:
             response = ssm_client.get_parameter(Name=parameter_name)
             initial_load_complete = response['Parameter']['Value'] == 'true'
-            logger.info("Initial load already completed.")
         except ssm_client.exceptions.ParameterNotFound:
             initial_load_complete = False
-            logger.info("Initial load not yet completed. Starting backfill...")
         
         # MODE 1: Initial Backfill
         if not initial_load_complete:
-            logger.info("Running initial backfill...")
             ids = get_all_query_ids()
             
             count = process_query_ids(ids)
@@ -257,7 +241,6 @@ def handler(event, context):
 
         # MODE 2: Scheduled Event (Poll SQS)
         else:
-            logger.info("Processing Scheduled Event (Polling SQS)...")
             count = poll_sqs_and_process(context)
             return {'statusCode': 200, 'body': json.dumps({'message': 'Scheduled polling completed', 'count': count})}
 
